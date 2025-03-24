@@ -4,7 +4,9 @@ from flask_cors import CORS
 import requests
 import os
 import time
-import sqlite3
+from sqlalchemy import create_engine, Column, String, Integer, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 import re
 import json
 import uuid
@@ -13,178 +15,146 @@ import random
 
 # Initialize Flask app
 app = Flask(__name__)
-
-# Configure CORS (update with your frontend URL after deployment)
 CORS(app, resources={r"/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:8081"]}})
 
 # Load environment variables
 from dotenv import load_dotenv
-load_dotenv()  # For local dev; Render uses its own env vars
+load_dotenv()
 API_KEY = os.environ.get("HF_API_KEY")
 if not API_KEY:
     print("Warning: HF_API_KEY not found! Please set it in environment variables.")
 else:
     print(f"Loaded API Key: {API_KEY[:4]}... (hidden for security)")
 API_URL = "https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1"
-CHAT_DB = os.environ.get("CHAT_DB", "data/chat.db")  # Allow override via env var
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Provided by Render PostgreSQL
 MAX_HISTORY = 6
 
-# Ensure data directory exists
-os.makedirs(os.path.dirname(CHAT_DB), exist_ok=True)
+# SQLAlchemy setup for PostgreSQL
+engine = create_engine(DATABASE_URL, echo=False)
+Base = declarative_base()
 
-# SQLite setup
-def init_db():
-    try:
-        conn = sqlite3.connect(CHAT_DB)
-        conn.execute("PRAGMA journal_mode=WAL")
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chat_history (
-                chat_id TEXT PRIMARY KEY,
-                user_msg TEXT,
-                ai_msg TEXT,
-                timestamp TEXT,
-                title TEXT,
-                welcome_shown INTEGER DEFAULT 0
-            )
-        """)
-        cursor.execute("PRAGMA table_info(chat_history)")
-        columns = {col[1] for col in cursor.fetchall()}
-        if "title" not in columns:
-            cursor.execute("ALTER TABLE chat_history ADD COLUMN title TEXT")
-            print("Added 'title' column!")
-        if "welcome_shown" not in columns:
-            cursor.execute("ALTER TABLE chat_history ADD COLUMN welcome_shown INTEGER DEFAULT 0")
-            print("Added 'welcome_shown' column!")
-        cursor.execute("""
-            UPDATE chat_history 
-            SET title = CASE 
-                WHEN user_msg IS NOT NULL AND user_msg != '' THEN 'Chat about ' || substr(user_msg, 1, 20) || '...' 
-                ELSE 'Chat ' || chat_id 
-            END 
-            WHERE title IS NULL OR title = ''
-        """)
-        conn.commit()
-    except sqlite3.Error as e:
-        print(f"SQLite error during init_db: {e}")
-    finally:
-        conn.close()
+class ChatHistory(Base):
+    __tablename__ = "chat_history"
+    chat_id = Column(String, primary_key=True)
+    user_msg = Column(Text)
+    ai_msg = Column(Text)
+    timestamp = Column(String)
+    title = Column(String)
+    welcome_shown = Column(Integer, default=0)
 
-init_db()
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
 
+# Database functions
 def store_chat(chat_id, user_msg, ai_msg, title=None, welcome_shown=0):
+    session = Session()
     try:
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         title = title or (f"Chat about {user_msg[:20]}..." if user_msg else f"Chat {chat_id}")
         ai_msg = re.sub(r'\[INST\].*?\[/INST\]', '', ai_msg, flags=re.DOTALL)
         ai_msg = re.sub(r'<s>', '', ai_msg).strip()
-        cursor.execute(
-            "INSERT OR REPLACE INTO chat_history (chat_id, user_msg, ai_msg, timestamp, title, welcome_shown) VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, user_msg, ai_msg, timestamp, title, welcome_shown))
-        conn.commit()
+        chat = ChatHistory(
+            chat_id=chat_id,
+            user_msg=user_msg,
+            ai_msg=ai_msg,
+            timestamp=timestamp,
+            title=title,
+            welcome_shown=welcome_shown
+        )
+        session.merge(chat)  # Upsert behavior
+        session.commit()
         print(f"Stored chat: chat_id={chat_id}, title={title}")
-    except sqlite3.Error as e:
-        print(f"SQLite error during store_chat: {e}")
+    except Exception as e:
+        print(f"Database error during store_chat: {e}")
+        session.rollback()
     finally:
-        conn.close()
+        session.close()
 
 def get_chat_history(chat_id):
+    session = Session()
     try:
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_msg, ai_msg FROM chat_history WHERE chat_id=? ORDER BY timestamp", (chat_id,))
-        history = [{"user": user, "ai": ai} for user, ai in cursor.fetchall()]
-        cleaned_history = [
-            {"user": msg["user"], "ai": re.sub(r'^You are AlgoAI.*$', '', msg["ai"], flags=re.MULTILINE).strip()}
-            for msg in history if msg["user"] or msg["ai"]
-        ]
-        return cleaned_history
-    except sqlite3.Error as e:
-        print(f"SQLite error during get_chat_history: {e}")
+        chats = session.query(ChatHistory).filter_by(chat_id=chat_id).order_by(ChatHistory.timestamp).all()
+        history = [{"user": chat.user_msg, "ai": re.sub(r'^You are AlgoAI.*$', '', chat.ai_msg, flags=re.MULTILINE).strip()}
+                   for chat in chats if chat.user_msg or chat.ai_msg]
+        return history
+    except Exception as e:
+        print(f"Database error during get_chat_history: {e}")
         return []
     finally:
-        conn.close()
+        session.close()
 
 def get_previous_response(chat_id):
+    session = Session()
     try:
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
-        cursor.execute("SELECT ai_msg FROM chat_history WHERE chat_id=? ORDER BY timestamp DESC LIMIT 1", (chat_id,))
-        last_response = cursor.fetchone()
-        return last_response[0] if last_response else None
-    except sqlite3.Error as e:
-        print(f"SQLite error during get_previous_response: {e}")
+        last_chat = session.query(ChatHistory).filter_by(chat_id=chat_id).order_by(ChatHistory.timestamp.desc()).first()
+        return last_chat.ai_msg if last_chat else None
+    except Exception as e:
+        print(f"Database error during get_previous_response: {e}")
         return None
     finally:
-        conn.close()
+        session.close()
 
 def has_welcome_been_shown(chat_id):
+    session = Session()
     try:
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
-        cursor.execute("SELECT welcome_shown FROM chat_history WHERE chat_id=?", (chat_id,))
-        result = cursor.fetchone()
-        return result[0] if result else 0
-    except sqlite3.Error as e:
-        print(f"SQLite error during has_welcome_been_shown: {e}")
+        chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
+        return chat.welcome_shown if chat else 0
+    except Exception as e:
+        print(f"Database error during has_welcome_been_shown: {e}")
         return 0
     finally:
-        conn.close()
+        session.close()
 
 def get_chat_by_title_or_id(identifier):
+    session = Session()
     try:
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT chat_id, user_msg, ai_msg, title FROM chat_history WHERE chat_id=? ORDER BY timestamp",
-            (identifier,))
-        row = cursor.fetchone()
-        if row:
-            chat_id, user_msg, ai_msg, title = row
-            history = [{"user": user_msg, "ai": ai_msg}] if user_msg or ai_msg else []
-            return {"chat_id": chat_id, "title": title or f"Chat about {user_msg[:20]}..." if user_msg else f"Chat {chat_id}", "history": history}
-        cursor.execute(
-            "SELECT chat_id, user_msg, ai_msg, title FROM chat_history WHERE title=? ORDER BY timestamp",
-            (identifier,))
-        row = cursor.fetchone()
-        if row:
-            chat_id, user_msg, ai_msg, title = row
-            history = [{"user": user_msg, "ai": ai_msg}] if user_msg or ai_msg else []
-            return {"chat_id": chat_id, "title": title, "history": history}
+        chat = session.query(ChatHistory).filter_by(chat_id=identifier).order_by(ChatHistory.timestamp).first()
+        if not chat:
+            chat = session.query(ChatHistory).filter_by(title=identifier).order_by(ChatHistory.timestamp).first()
+        if chat:
+            history = [{"user": chat.user_msg, "ai": chat.ai_msg}] if chat.user_msg or chat.ai_msg else []
+            return {"chat_id": chat.chat_id, "title": chat.title or f"Chat about {chat.user_msg[:20]}..." if chat.user_msg else f"Chat {chat.chat_id}", "history": history}
         return None
-    except sqlite3.Error as e:
-        print(f"SQLite error during get_chat_by_title_or_id: {e}")
+    except Exception as e:
+        print(f"Database error during get_chat_by_title_or_id: {e}")
         return None
     finally:
-        conn.close()
+        session.close()
 
 def get_all_chats():
+    session = Session()
     try:
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
-        cursor.execute("SELECT chat_id, user_msg, title, ai_msg FROM chat_history ORDER BY timestamp DESC")
-        chats = cursor.fetchall()
+        chats = session.query(ChatHistory).order_by(ChatHistory.timestamp.desc()).all()
         unique_titles = []
         seen_chat_ids = set()
-        for chat_id, user_msg, title, ai_msg in chats:
-            if chat_id in seen_chat_ids:
+        for chat in chats:
+            if chat.chat_id in seen_chat_ids:
                 continue
-            final_title = (title if title and title.strip() else
-                           (f"Chat about {user_msg[:20]}..." if user_msg and user_msg.strip() else
-                            f"Chat started with {ai_msg[:20]}..." if ai_msg and ai_msg.strip() else
-                            f"Chat {chat_id}"))[:100]
-            unique_titles.append({"chat_id": chat_id, "title": final_title})
-            seen_chat_ids.add(chat_id)
+            final_title = (chat.title if chat.title and chat.title.strip() else
+                           (f"Chat about {chat.user_msg[:20]}..." if chat.user_msg and chat.user_msg.strip() else
+                            f"Chat started with {chat.ai_msg[:20]}..." if chat.ai_msg and chat.ai_msg.strip() else
+                            f"Chat {chat.chat_id}"))[:100]
+            unique_titles.append({"chat_id": chat.chat_id, "title": final_title})
+            seen_chat_ids.add(chat.chat_id)
         return unique_titles
-    except sqlite3.Error as e:
-        print(f"SQLite error during get_all_chats: {e}")
+    except Exception as e:
+        print(f"Database error during get_all_chats: {e}")
         return []
     finally:
-        conn.close()
+        session.close()
 
-# classify_query, format_response, query_mistral remain unchanged
+def get_chat_title(chat_id):
+    session = Session()
+    try:
+        chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
+        return chat.title if chat else None
+    except Exception as e:
+        print(f"Database error during get_chat_title: {e}")
+        return None
+    finally:
+        session.close()
+
+# Rest of your functions (unchanged)
 def classify_query(prompt):
     tech_keywords = r"\b(code|python|java|c\+\+|javascript|js|typescript|ruby|php|go|rust|kotlin|swift|c#|perl|scala|r|matlab|sql|nosql|algorithm|O\(.*\)|recursion|data structure|machine learning|neural network|database|API|backend|frontend|AI|time complexity|sorting|engineering|system design|software|hardware|math|algebra|calculus|geometry|statistics|probability|optimization|cloud|devops|docker|kubernetes|git|aws|azure|gcp|ci|cd|cybersecurity|game|development|network|array)\b"
     tech_patterns = [
@@ -207,32 +177,28 @@ def format_response(response):
         return "Error: No response generated. Please try again."
     response = re.sub(r'\n\s*\n{2,}', '\n\n', response, flags=re.DOTALL)
     response = re.sub(r'^\s*-\s*', '- ', response, flags=re.MULTILINE)
-
     if "```" in response:
         open_blocks = len(re.findall(r'```[a-zA-Z]*', response))
         close_blocks = len(re.findall(r'```', response)) - open_blocks
         if open_blocks > close_blocks:
             response += "\n```"
-
     if "Code Example" in response and not re.search(r'```', response):
         response += "\n**Code Example (Python):**\n```python\nprint(\"Hello, world!\")  # Default example\n```"
-    
-    if not re.search(r"\*\*Code Example $$     Python     $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$   Python   $$:\*\*", response):
         response = re.sub(r"```python", "**Code Example (Python):**\n```python", response)
-    if not re.search(r"\*\*Code Example $$     Java     $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$   Java   $$:\*\*", response):
         response = re.sub(r"```java", "**Code Example (Java):**\n```java", response)
-    if not re.search(r"\*\*Code Example $$     C\+\+     $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$   C\+\+   $$:\*\*", response):
         response = re.sub(r"```cpp", "**Code Example (C++):**\n```cpp", response)
-    if not re.search(r"\*\*Code Example $$     JavaScript     $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$   JavaScript   $$:\*\*", response):
         response = re.sub(r"```javascript", "**Code Example (JavaScript):**\n```javascript", response)
-    if not re.search(r"\*\*Code Example $$     TypeScript     $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$   TypeScript   $$:\*\*", response):
         response = re.sub(r"```typescript", "**Code Example (TypeScript):**\n```typescript", response)
-    if not re.search(r"\*\*Code Example $$     Go     $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$   Go   $$:\*\*", response):
         response = re.sub(r"```go", "**Code Example (Go):**\n```go", response)
-    if not re.search(r"\*\*Code Example $$     Rust     $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$   Rust   $$:\*\*", response):
         response = re.sub(r"```rust", "**Code Example (Rust):**\n```rust", response)
     response = re.sub(r"```", "\n```", response)
-
     if classify_query(response.split("\n")[0]) == "greeting":
         response = re.split(r'(?<=[.!?])\s+', response)[0] + "."
     if len(response) > 3000:
@@ -245,7 +211,6 @@ def query_mistral(chat_id, prompt, deep_dive=False):
     mode = classify_query(prompt)
     last_response = get_previous_response(chat_id) if deep_dive else None
     chat_history = get_chat_history(chat_id)[-MAX_HISTORY:]
-
     SYSTEM_PROMPT = (
         "You are AlgoAI, an expert in coding, algorithms, and system design. Your responses must always be:\n"
         "- **Fully detailed and well-structured** with clear, numbered sections as instructed.\n"
@@ -262,7 +227,6 @@ def query_mistral(chat_id, prompt, deep_dive=False):
         "- For general queries or deep dives, adapt the structure but maintain depth and interactivity.\n"
         "- If a code example is requested but not provided, include a default example (e.g., a simple Python `print()` statement).\n"
     )
-
     full_prompt = f"<s>[INST] {SYSTEM_PROMPT}\n\n### Conversation Context:\n"
     if chat_history:
         full_prompt += "Here’s our recent chat for context:\n"
@@ -270,13 +234,10 @@ def query_mistral(chat_id, prompt, deep_dive=False):
             full_prompt += f"User: {msg['user']}\nAlgoAI: {msg['ai']}\n"
     else:
         full_prompt += "This is a fresh start—no chat history yet.\n"
-
     full_prompt += f"\n### User Prompt:\nUser: {prompt}\n\n### Instructions:\n"
-
     welcome_shown = has_welcome_been_shown(chat_id)
     if mode == "greeting" and welcome_shown:
         return "Please provide your next query."
-
     if mode == "greeting":
         full_prompt += (
             "Respond with a concise, professional greeting (1 sentence). "
@@ -300,7 +261,7 @@ def query_mistral(chat_id, prompt, deep_dive=False):
             temp = 0.2
         else:
             full_prompt += (
-                "Provide a clear, step-by-step technical response:\n"
+                "Provide MIXTRAL clear, step-by-step technical response:\n"
                 "**1. Clarify Intent**: State the intent and preferred language (**{preferred_language}** if specified, else Python) (1 sentence).\n"
                 "**2. Concept Explanation**: Explain the algorithmic foundation with theory (2-3 sentences).\n"
                 "**3. Complexity Analysis**: Break down the logical structure with Big-O time and space complexity (2-3 sentences).\n"
@@ -337,7 +298,6 @@ def query_mistral(chat_id, prompt, deep_dive=False):
                 )
             max_tokens = 400
         temp = 0.3
-
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"} if API_KEY else {}
     data = {
         "inputs": full_prompt,
@@ -348,7 +308,6 @@ def query_mistral(chat_id, prompt, deep_dive=False):
             "repetition_penalty": 1.1
         }
     }
-
     for attempt in range(3):
         try:
             response = requests.post(API_URL, headers=headers, json=data, timeout=30, verify=certifi.where())
@@ -361,7 +320,6 @@ def query_mistral(chat_id, prompt, deep_dive=False):
                 bot_response = json_response["generated_text"].strip()
             else:
                 return "Apologies, I couldn’t process that due to an API glitch. Please try again."
-
             if bot_response:
                 if "[/INST]" in bot_response:
                     bot_response = bot_response.split("[/INST]", 1)[1].strip()
@@ -376,7 +334,7 @@ def query_mistral(chat_id, prompt, deep_dive=False):
                 return f"Error: API failed—{str(e)}. Please check your API key or model access."
             time.sleep(2 ** attempt)
 
-# Routes (updated for API-only use)
+# Routes
 @app.route("/")
 def home():
     return jsonify({"message": "Welcome to AlgoAI! Use /query to begin."}), 200
@@ -423,23 +381,21 @@ def new_chat():
 
 @app.route("/reset_chat", methods=["POST"])
 def reset_chat():
+    session = Session()
     try:
         data = request.get_json()
         chat_id = data.get("chat_id")
         if not chat_id:
             return jsonify({"error": "No chat_id provided."}), 400
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM chat_history WHERE chat_id=?", (chat_id,))
-        conn.commit()
-        conn.close()
+        session.query(ChatHistory).filter_by(chat_id=chat_id).delete()
+        session.commit()
         return jsonify({"message": f"Chat {chat_id} has been reset.", "chat_id": chat_id})
-    except sqlite3.Error as e:
-        print(f"SQLite error during reset_chat: {e}")
-        return jsonify({"error": f"Failed to reset chat—{e}"}), 500
     except Exception as e:
         print(f"Error in reset_chat: {e}")
+        session.rollback()
         return jsonify({"error": f"Reset failed—{e}"}), 500
+    finally:
+        session.close()
 
 @app.route("/get_current_chat", methods=["GET"])
 def get_current_chat():
@@ -451,19 +407,6 @@ def get_current_chat():
     except Exception as e:
         print(f"Error in get_current_chat: {e}")
         return jsonify({"error": f"Failed to fetch chat—{e}"}), 500
-
-def get_chat_title(chat_id):
-    try:
-        conn = sqlite3.connect(CHAT_DB)
-        cursor = conn.cursor()
-        cursor.execute("SELECT title FROM chat_history WHERE chat_id=?", (chat_id,))
-        result = cursor.fetchone()
-        return result[0] if result else None
-    except sqlite3.Error as e:
-        print(f"SQLite error during get_chat_title: {e}")
-        return None
-    finally:
-        conn.close()
 
 @app.route("/get_chat_history", methods=["GET"])
 def get_chat_history_endpoint():
@@ -503,5 +446,3 @@ def update_chat(chat_id):
 @app.route("/test")
 def test():
     return jsonify({"message": "Backend is operational!"})
-
-# No app.run() here; Render uses Gunicorn
