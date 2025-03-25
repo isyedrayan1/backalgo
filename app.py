@@ -443,6 +443,23 @@ def update_chat(chat_id):
         print(f"Error in update_chat: {e}")
         return jsonify({"error": f"Update failed—{e}", "chat_id": chat_id}), 500
 
+@app.route('/update_chat_title', methods=['POST'])
+def update_chat_title():
+    data = request.get_json()
+    chat_id = data.get('chat_id')
+    new_title = data.get('title')
+
+    if not chat_id or not new_title:
+        return jsonify({"error": "chat_id and title are required"}), 400
+
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+    c.execute("UPDATE chats SET title = ? WHERE chat_id = ?", (new_title, chat_id))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "Chat title updated successfully"})
+    
 @app.route("/test")
 def test():
     return jsonify({"message": "Backend is operational!"})
