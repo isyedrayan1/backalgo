@@ -25,7 +25,7 @@ if not API_KEY:
     print("Warning: HF_API_KEY not found! Please set it in environment variables.")
 else:
     print(f"Loaded API Key: {API_KEY[:4]}... (hidden for security)")
-API_URL = "https://api-inference.huggingface.co/codellama/CodeLlama-7b-Instruct-hf"
+API_URL = "https://api-inference.huggingface.co/mistralai/Mistral-7B-v0.1"
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Provided by Render PostgreSQL
 MAX_HISTORY = 6
 
