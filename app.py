@@ -15,7 +15,7 @@ import random
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:8081", "http://127.0.0.1:5500", "https://backalgo-frontend.onrender.com"]}})
+CORS(app, resources={r"/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:8081", "http://127.0.0.1:5500", "https://backalgo-frontend.onrender.com","chat-algo.netlify.app"]}})
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -25,7 +25,7 @@ if not API_KEY:
     print("Warning: HF_API_KEY not found! Please set it in environment variables.")
 else:
     print(f"Loaded API Key: {API_KEY[:4]}... (hidden for security)")
-API_URL = "https://api-inference.huggingface.co/mistralai/Mistral-7B-v0.1"
+API_URL = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta"
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Provided by Render PostgreSQL
 MAX_HISTORY = 6
 
