@@ -15,7 +15,7 @@ import random
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:8081", "http://127.0.0.1:5500", "https://backalgo-frontend.onrender.com","chat-algo.netlify.app"]}})
+CORS(app, resources={r"/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:8081", "http://127.0.0.1:5500", "https://backalgo-frontend.onrender.com"]}})
 
 # Load environment variables
 from dotenv import load_dotenv
