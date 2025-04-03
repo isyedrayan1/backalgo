@@ -16,19 +16,24 @@ import random
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
 # Load environment variables
 from dotenv import load_dotenv
 load_dotenv()
-API_KEY = os.environ.get("HF_API_KEY")
-if not API_KEY:
-    print("Warning: HF_API_KEY not found! Please set it in environment variables.")
+
+# Updated to use Groq API Key
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    print("Warning: GROQ_API_KEY not found! Please set it in environment variables.")
 else:
-    print(f"Loaded API Key: {API_KEY[:4]}... (hidden for security)")
-API_URL = "https://api-inference.huggingface.co/models/google/gemma-3-1b-it"
+    print(f"Loaded Groq API Key: {GROQ_API_KEY[:4]}... (hidden for security)")
+
+# Updated to Groq API URL
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Provided by Render PostgreSQL
 MAX_HISTORY = 6
 
-# SQLAlchemy setup for PostgreSQL
+# SQLAlchemy setup for PostgreSQL (unchanged)
 engine = create_engine(DATABASE_URL, echo=False)
 Base = declarative_base()
 
@@ -44,7 +49,7 @@ class ChatHistory(Base):
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
-# Database functions
+# Database functions (unchanged)
 def store_chat(chat_id, user_msg, ai_msg, title=None, welcome_shown=0):
     session = Session()
     try:
@@ -183,19 +188,19 @@ def format_response(response):
             response += "\n```"
     if "Code Example" in response and not re.search(r'```', response):
         response += "\n**Code Example (Python):**\n```python\nprint(\"Hello, world!\")  # Default example\n```"
-    if not re.search(r"\*\*Code Example $$   Python   $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$     Python     $$:\*\*", response):
         response = re.sub(r"```python", "**Code Example (Python):**\n```python", response)
-    if not re.search(r"\*\*Code Example $$   Java   $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$     Java     $$:\*\*", response):
         response = re.sub(r"```java", "**Code Example (Java):**\n```java", response)
-    if not re.search(r"\*\*Code Example $$   C\+\+   $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$     C\+\+     $$:\*\*", response):
         response = re.sub(r"```cpp", "**Code Example (C++):**\n```cpp", response)
-    if not re.search(r"\*\*Code Example $$   JavaScript   $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$     JavaScript     $$:\*\*", response):
         response = re.sub(r"```javascript", "**Code Example (JavaScript):**\n```javascript", response)
-    if not re.search(r"\*\*Code Example $$   TypeScript   $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$     TypeScript     $$:\*\*", response):
         response = re.sub(r"```typescript", "**Code Example (TypeScript):**\n```typescript", response)
-    if not re.search(r"\*\*Code Example $$   Go   $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$     Go     $$:\*\*", response):
         response = re.sub(r"```go", "**Code Example (Go):**\n```go", response)
-    if not re.search(r"\*\*Code Example $$   Rust   $$:\*\*", response):
+    if not re.search(r"\*\*Code Example $$     Rust     $$:\*\*", response):
         response = re.sub(r"```rust", "**Code Example (Rust):**\n```rust", response)
     response = re.sub(r"```", "\n```", response)
     if classify_query(response.split("\n")[0]) == "greeting":
@@ -206,10 +211,12 @@ def format_response(response):
         response += " Please provide more details if needed."
     return response
 
-def query_mistral(chat_id, prompt, deep_dive=False):
+# Updated to use Groq instead of Mistral/Hugging Face
+def query_groq(chat_id, prompt, deep_dive=False):
     mode = classify_query(prompt)
     last_response = get_previous_response(chat_id) if deep_dive else None
     chat_history = get_chat_history(chat_id)[-MAX_HISTORY:]
+
     SYSTEM_PROMPT = (
         "You are AlgoAI, an expert in coding, algorithms, and system design. Your responses must always be:\n"
         "- **Fully detailed and well-structured** with clear, numbered sections as instructed.\n"
@@ -226,114 +233,112 @@ def query_mistral(chat_id, prompt, deep_dive=False):
         "- For general queries or deep dives, adapt the structure but maintain depth and interactivity.\n"
         "- If a code example is requested but not provided, include a default example (e.g., a simple Python `print()` statement).\n"
     )
-    full_prompt = f"<s>[INST] {SYSTEM_PROMPT}\n\n### Conversation Context:\n"
+
+    # Build messages array for Groq (OpenAI-style)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if chat_history:
-        full_prompt += "Here’s our recent chat for context:\n"
         for msg in chat_history:
-            full_prompt += f"User: {msg['user']}\nAlgoAI: {msg['ai']}\n"
-    else:
-        full_prompt += "This is a fresh start—no chat history yet.\n"
-    full_prompt += f"\n### User Prompt:\nUser: {prompt}\n\n### Instructions:\n"
+            messages.append({"role": "user", "content": msg["user"]})
+            messages.append({"role": "assistant", "content": msg["ai"]})
+    messages.append({"role": "user", "content": prompt})
+
+    # Mode-specific parameters (kept consistent with your original logic)
     welcome_shown = has_welcome_been_shown(chat_id)
     if mode == "greeting" and welcome_shown:
         return "Please provide your next query."
-    if mode == "greeting":
-        full_prompt += (
-            "Respond with a concise, professional greeting (1 sentence). "
-            "End with: **Please provide your next query.** [/INST]"
-        )
+    elif mode == "greeting":
         max_tokens = 100
         temp = 0.3
+        follow_up = "**Please provide your next query.**"
     elif mode == "tech":
         language_match = re.search(r'\b(in|using)\s*(python|java|c\+\+|javascript|typescript|go|rust|ruby|php|kotlin|swift)\b', prompt, re.IGNORECASE)
         preferred_language = language_match.group(2).lower() if language_match else "python"
         if deep_dive and last_response:
-            full_prompt += (
+            messages.append({"role": "system", "content": (
                 f"Build on the previous response: **Previous response: {last_response}**\n"
                 "**1. Detailed Analysis**: Analyze the last response in depth (2-3 sentences).\n"
                 "**2. Improvements**: Suggest specific optimizations or debugging tips if code was included (2-3 sentences).\n"
                 "**3. Alternatives**: Compare with at least one alternative approach (1-2 sentences).\n"
                 "**4. Next Steps**: Propose a related topic or question (1 sentence).\n"
-                "No repeats—keep it new. End with: **Would you like a different approach or more depth?** [/INST]"
-            )
+                "No repeats—keep it new."
+            )})
             max_tokens = 1200
             temp = 0.2
+            follow_up = "**Would you like a different approach or more depth?**"
         else:
-            full_prompt += (
-                "Provide MIXTRAL clear, step-by-step technical response:\n"
-                "**1. Clarify Intent**: State the intent and preferred language (**{preferred_language}** if specified, else Python) (1 sentence).\n"
+            messages.append({"role": "system", "content": (
+                f"Provide a clear, step-by-step technical response:\n"
+                f"**1. Clarify Intent**: State the intent and preferred language (**{preferred_language}** if specified, else Python) (1 sentence).\n"
                 "**2. Concept Explanation**: Explain the algorithmic foundation with theory (2-3 sentences).\n"
                 "**3. Complexity Analysis**: Break down the logical structure with Big-O time and space complexity (2-3 sentences).\n"
                 "**4. Example Implementation**: Show a clean, well-commented code example in {preferred_language} with ``` blocks (2-3 sentences).\n"
                 "**5. Alternative Approaches**: Suggest at least one alternative solution (1-2 sentences).\n"
                 "**6. Performance Optimization**: Offer ways to improve efficiency or scalability (1-2 sentences).\n"
-                "**7. Next Steps**: Encourage exploration of related topics (1 sentence).\n"
-                "End with: **Would you like a deeper explanation?** [/INST]"
-            )
+                "**7. Next Steps**: Encourage exploration of related topics (1 sentence)."
+            )})
             max_tokens = 1000
             temp = 0.2
+            follow_up = "**Would you like a deeper explanation?**"
     else:
         if deep_dive and last_response:
-            full_prompt += (
+            messages.append({"role": "system", "content": (
                 f"Expand on the previous response: **Previous response: {last_response}**\n"
                 "**1. In-Depth Analysis**: Provide detailed insights or examples (2-3 sentences).\n"
                 "**2. Improvements**: Suggest enhancements or related considerations (1-2 sentences).\n"
                 "**3. Next Steps**: Encourage further exploration (1 sentence).\n"
-                "No repeats—keep it new. End with: **Would you like to dig deeper?** [/INST]"
-            )
+                "No repeats—keep it new."
+            )})
             max_tokens = 600
+            temp = 0.3
+            follow_up = "**Would you like to dig deeper?**"
         else:
             if "joke" in prompt.lower():
-                full_prompt += (
-                    "Provide a lighthearted joke, followed by a brief response related to the query (2-3 sentences).\n"
-                    "End with: **Do you have further questions or would you like a deeper explanation on a topic?** [/INST]"
-                )
+                messages.append({"role": "system", "content": (
+                    "Provide a lighthearted joke, followed by a brief response related to the query (2-3 sentences)."
+                )})
+                follow_up = "**Do you have further questions or would you like a deeper explanation on a topic?**"
             else:
-                full_prompt += (
+                messages.append({"role": "system", "content": (
                     "Give a clear, concise response:\n"
                     "**1. Direct Answer**: Answer the question directly (1-2 sentences).\n"
-                    "**2. Context**: Add relevant context if applicable (1 sentence).\n"
-                    "End with: **Do you have further questions or would you like a deeper explanation on a topic?** [/INST]"
-                )
+                    "**2. Context**: Add relevant context if applicable (1 sentence)."
+                )})
+                follow_up = "**Do you have further questions or would you like a deeper explanation on a topic?**"
             max_tokens = 400
-        temp = 0.3
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"} if API_KEY else {}
+            temp = 0.3
+
+    # Groq API call
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     data = {
-        "inputs": full_prompt,
-        "parameters": {
-            "max_new_tokens": max_tokens,
-            "temperature": temp,
-            "top_p": 0.9,
-            "repetition_penalty": 1.1
-        }
+        "model": "mixtral-8x7b-32768",  # Groq’s Mixtral model; can switch to "llama-3.3-70b-versatile" if preferred
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temp,
+        "top_p": 0.9,
+        "repetition_penalty": 1.1
     }
+
     for attempt in range(3):
         try:
-            response = requests.post(API_URL, headers=headers, json=data, timeout=30, verify=certifi.where())
+            print(f"Sending Groq request: mode={mode}, prompt_length={len(prompt)}")
+            response = requests.post(GROQ_API_URL, headers=headers, json=data, timeout=30)
             response.raise_for_status()
             json_response = response.json()
-            bot_response = None
-            if isinstance(json_response, list) and len(json_response) > 0 and "generated_text" in json_response[0]:
-                bot_response = json_response[0]["generated_text"].strip()
-            elif "generated_text" in json_response:
-                bot_response = json_response["generated_text"].strip()
-            else:
-                return "Apologies, I couldn’t process that due to an API glitch. Please try again."
-            if bot_response:
-                if "[/INST]" in bot_response:
-                    bot_response = bot_response.split("[/INST]", 1)[1].strip()
-                bot_response = bot_response.replace(SYSTEM_PROMPT, '').strip()
-                if not bot_response:
-                    return "No response generated. Please provide more details and try again."
-                return bot_response
-            return "An error occurred. Please retry your query."
+            bot_response = json_response["choices"][0]["message"]["content"].strip()
+            if not bot_response:
+                return "Error: No response generated. Please try again."
+            # Append follow-up question if not already present
+            if follow_up and follow_up not in bot_response:
+                bot_response += f"\n\n{follow_up}"
+            print(f"Groq response received: length={len(bot_response)}")
+            return bot_response
         except requests.RequestException as e:
-            print(f"API error, attempt {attempt + 1}: {e}")
+            print(f"Groq API error, attempt {attempt + 1}: {e}")
             if attempt == 2:
-                return f"Error: API failed—{str(e)}. Please check your API key or model access."
+                return f"Error: Groq API failed after 3 attempts—{str(e)}. Please try again later."
             time.sleep(2 ** attempt)
 
-# Routes
+# Routes (updated to use query_groq)
 @app.route("/")
 def home():
     return jsonify({"message": "Welcome to AlgoAI! Use /query to begin."}), 200
@@ -349,8 +354,8 @@ def get_response():
         user_query = data.get("query", "No query provided.")
         chat_id = data.get("chat_id", str(uuid.uuid4()))
         deep_dive = data.get("deep_dive", False)
-        mistral_response = query_mistral(chat_id, user_query, deep_dive)
-        formatted_response = format_response(mistral_response)
+        groq_response = query_groq(chat_id, user_query, deep_dive)  # Updated to Groq
+        formatted_response = format_response(groq_response)
         store_chat(chat_id, user_query, formatted_response)
         return jsonify({"response": formatted_response, "chat_id": chat_id})
     except Exception as e:
@@ -451,14 +456,22 @@ def update_chat_title():
     if not chat_id or not new_title:
         return jsonify({"error": "chat_id and title are required"}), 400
 
-    conn = sqlite3.connect('chat_history.db')
-    c = conn.cursor()
-    c.execute("UPDATE chats SET title = ? WHERE chat_id = ?", (new_title, chat_id))
-    conn.commit()
-    conn.close()
+    # Fixed: Use SQLAlchemy instead of sqlite3 to match your DB setup
+    session = Session()
+    try:
+        chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
+        if chat:
+            chat.title = new_title
+            session.commit()
+            return jsonify({"message": "Chat title updated successfully"})
+        return jsonify({"error": "Chat not found"}), 404
+    except Exception as e:
+        print(f"Error in update_chat_title: {e}")
+        session.rollback()
+        return jsonify({"error": f"Title update failed—{e}"}), 500
+    finally:
+        session.close()
 
-    return jsonify({"message": "Chat title updated successfully"})
-    
 @app.route("/test")
 def test():
     return jsonify({"message": "Backend is operational!"})
