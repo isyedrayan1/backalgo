@@ -28,7 +28,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # SQLAlchemy setup for PostgreSQL
-engine = create_engine(DATABASE_URL, echo=False, connect_args={"ssl": {"ca": certifi.where()}})
+engine = create_engine(DATABASE_URL, echo=False)
 Base = declarative_base()
 
 class ChatHistory(Base):
@@ -208,7 +208,7 @@ def format_response(response):
 
 # Groq API Query Function
 def query_groq(chat_id, prompt, deep_dive=False):
-    print("DEBUG: Running query_groq v3 - 2025-04-03 12:00 UTC")
+    print("DEBUG: Running query_groq v4 - 2025-04-03 15:00 UTC")
     mode = classify_query(prompt)
     last_response = get_previous_response(chat_id) if deep_dive else None
     chat_history = get_chat_history(chat_id)[-MAX_HISTORY:]
@@ -251,7 +251,7 @@ def query_groq(chat_id, prompt, deep_dive=False):
     for attempt in range(3):
         try:
             print(f"Attempt {attempt + 1} - Sending Groq request: mode={mode}, prompt_length={len(str(prompt) or '')}")
-            response = requests.post(GROQ_API_URL, headers=headers, json=data, timeout=30, verify=True)
+            response = requests.post(GROQ_API_URL, headers=headers, json=data, timeout=30)
             response.raise_for_status()
             json_response = response.json()
             bot_response = json_response["choices"][0]["message"]["content"].strip()
