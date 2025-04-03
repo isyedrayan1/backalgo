@@ -17,11 +17,11 @@ import random
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-# Load environment variables
+# Load environment variablesp
 from dotenv import load_dotenv
 load_dotenv()
 
-# Updated to use Groq API Key
+# Updated to use Groq API Keygit
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     print("Warning: GROQ_API_KEY not found! Please set it in environment variables.")
@@ -310,7 +310,7 @@ def query_groq(chat_id, prompt, deep_dive=False):
     # Groq API call
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": "mixtral-8x7b-32768",  # Groq’s Mixtral model; can switch to "llama-3.3-70b-versatile" if preferred
+        "model": "llama3-8b-8192",  # Groq’s Mixtral model; can switch to "llama-3.3-70b-versatile" if preferred
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temp,
