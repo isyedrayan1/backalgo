@@ -10,6 +10,7 @@ from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, Integer, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -34,13 +35,14 @@ Base = declarative_base()
 class ChatHistory(Base):
     __tablename__ = "chat_history"
     chat_id = Column(String, primary_key=True)
-    user_id = Column(String)  # Added to track user sessions
+    user_id = Column(String)  # Added to track user sessions, nullable for older records
     user_msg = Column(Text)
     ai_msg = Column(Text)
     timestamp = Column(String)
     title = Column(String)
     welcome_shown = Column(Integer, default=0)
 
+# Create tables if they don't exist
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
@@ -54,7 +56,7 @@ def store_chat(chat_id, user_id, user_msg, ai_msg, title=None, welcome_shown=0):
         ai_msg = re.sub(r'<s>', '', ai_msg).strip()
         chat = ChatHistory(
             chat_id=chat_id,
-            user_id=user_id,
+            user_id=user_id or '',  # Default to empty string if None
             user_msg=user_msg,
             ai_msg=ai_msg,
             timestamp=timestamp,
@@ -64,9 +66,10 @@ def store_chat(chat_id, user_id, user_msg, ai_msg, title=None, welcome_shown=0):
         session.merge(chat)
         session.commit()
         print(f"Stored chat: chat_id={chat_id}, title={title}")
-    except Exception as e:
+    except SQLAlchemyError as e:
         print(f"Database error during store_chat: {e}")
         session.rollback()
+        raise
     finally:
         session.close()
 
@@ -76,7 +79,7 @@ def get_chat_history(chat_id):
         chats = session.query(ChatHistory).filter_by(chat_id=chat_id).order_by(ChatHistory.timestamp).all()
         history = [{"user": chat.user_msg, "ai": chat.ai_msg} for chat in chats if chat.user_msg or chat.ai_msg]
         return history
-    except Exception as e:
+    except SQLAlchemyError as e:
         print(f"Database error during get_chat_history: {e}")
         return []
     finally:
@@ -87,7 +90,7 @@ def get_previous_response(chat_id):
     try:
         last_chat = session.query(ChatHistory).filter_by(chat_id=chat_id).order_by(ChatHistory.timestamp.desc()).first()
         return last_chat.ai_msg if last_chat else None
-    except Exception as e:
+    except SQLAlchemyError as e:
         print(f"Database error during get_previous_response: {e}")
         return None
     finally:
@@ -98,7 +101,7 @@ def has_welcome_been_shown(chat_id):
     try:
         chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
         return chat.welcome_shown if chat else 0
-    except Exception as e:
+    except SQLAlchemyError as e:
         print(f"Database error during has_welcome_been_shown: {e}")
         return 0
     finally:
@@ -114,7 +117,7 @@ def get_chat_by_title_or_id(identifier):
             history = [{"user": chat.user_msg, "ai": chat.ai_msg}] if chat.user_msg or chat.ai_msg else []
             return {"chat_id": chat.chat_id, "title": chat.title, "history": history}
         return None
-    except Exception as e:
+    except SQLAlchemyError as e:
         print(f"Database error during get_chat_by_title_or_id: {e}")
         return None
     finally:
@@ -132,7 +135,7 @@ def get_all_chats():
             unique_titles.append({"chat_id": chat.chat_id, "title": chat.title[:100]})
             seen_chat_ids.add(chat.chat_id)
         return unique_titles
-    except Exception as e:
+    except SQLAlchemyError as e:
         print(f"Database error during get_all_chats: {e}")
         return []
     finally:
@@ -143,7 +146,7 @@ def get_chat_title(chat_id):
     try:
         chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
         return chat.title if chat else None
-    except Exception as e:
+    except SQLAlchemyError as e:
         print(f"Database error during get_chat_title: {e}")
         return None
     finally:
@@ -443,14 +446,14 @@ def get_response():
         return jsonify({"response": formatted_response, "chat_id": chat_id})
     except Exception as e:
         print(f"Error in get_response: {e}")
-        return jsonify({"error": f"API request failed—{str(e)}", "chat_id": chat_id}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later.", "chat_id": chat_id}), 500
 
 @app.route("/new_chat", methods=["POST"])
 def new_chat():
     try:
         user_id = request.headers.get("X-User-ID") or request.remote_addr  # Example user tracking
         session = Session()
-        last_chat = session.query(ChatHistory).filter_by(user_id=user_id).order_by(ChatHistory.timestamp.desc()).first()
+        last_chat = session.query(ChatHistory).filter_by(chat_id=chat_id).order_by(ChatHistory.timestamp.desc()).first() if chat_id else None
         session.close()
 
         if last_chat and not request.args.get("force_new", False):
@@ -469,9 +472,12 @@ def new_chat():
         if is_returning:
             greeting = "Welcome back! I'm ready to assist with your next coding challenge. What would you like to explore?"
         return jsonify({"chat_id": chat_id, "greeting": greeting})
+    except SQLAlchemyError as e:
+        print(f"Database error in new_chat: {e}")
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     except Exception as e:
         print(f"Error in new_chat: {e}")
-        return jsonify({"error": f"Failed to create new chat—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
 
 @app.route("/reset_chat", methods=["POST"])
 def reset_chat():
@@ -484,10 +490,14 @@ def reset_chat():
         session.query(ChatHistory).filter_by(chat_id=chat_id).delete()
         session.commit()
         return jsonify({"message": f"Chat {chat_id} has been reset.", "chat_id": chat_id})
+    except SQLAlchemyError as e:
+        print(f"Database error in reset_chat: {e}")
+        session.rollback()
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     except Exception as e:
         print(f"Error in reset_chat: {e}")
         session.rollback()
-        return jsonify({"error": f"Reset failed—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     finally:
         session.close()
 
@@ -500,7 +510,7 @@ def get_current_chat():
         return jsonify({"chat_id": chat_id, "title": title, "history": history})
     except Exception as e:
         print(f"Error in get_current_chat: {e}")
-        return jsonify({"error": f"Failed to fetch chat—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later.", "chat_id": chat_id}), 500
 
 @app.route("/get_chat_history", methods=["GET"])
 def get_chat_history_endpoint():
@@ -509,7 +519,7 @@ def get_chat_history_endpoint():
         return jsonify({"chats": chats})
     except Exception as e:
         print(f"Error in get_chat_history_endpoint: {e}")
-        return jsonify({"error": f"Failed to fetch chat history—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
 
 @app.route("/get_chat/<identifier>", methods=["GET"])
 def get_chat(identifier):
@@ -518,9 +528,12 @@ def get_chat(identifier):
         if chat_data:
             return jsonify(chat_data)
         return jsonify({"error": "Chat not found!", "chat_id": identifier}), 404
+    except SQLAlchemyError as e:
+        print(f"Database error in get_chat: {e}")
+        return jsonify({"error": "An unexpected error occurred. Please try again later.", "chat_id": identifier}), 500
     except Exception as e:
         print(f"Error in get_chat: {e}")
-        return jsonify({"error": f"Chat fetch failed—{e}", "chat_id": identifier}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later.", "chat_id": identifier}), 500
 
 @app.route("/update_chat/<chat_id>", methods=["POST"])
 def update_chat(chat_id):
@@ -536,7 +549,7 @@ def update_chat(chat_id):
         return jsonify({"message": f"Chat {chat_id} updated successfully!", "chat_id": chat_id, "title": title})
     except Exception as e:
         print(f"Error in update_chat: {e}")
-        return jsonify({"error": f"Update failed—{e}", "chat_id": chat_id}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later.", "chat_id": chat_id}), 500
 
 @app.route('/update_chat_title', methods=['POST'])
 def update_chat_title():
@@ -555,10 +568,14 @@ def update_chat_title():
             session.commit()
             return jsonify({"message": "Chat title updated successfully"})
         return jsonify({"error": "Chat not found"}), 404
+    except SQLAlchemyError as e:
+        print(f"Database error in update_chat_title: {e}")
+        session.rollback()
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     except Exception as e:
         print(f"Error in update_chat_title: {e}")
         session.rollback()
-        return jsonify({"error": f"Title update failed—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     finally:
         session.close()
 
@@ -567,13 +584,17 @@ def clear_chats():
     session = Session()
     try:
         user_id = request.headers.get("X-User-ID") or request.remote_addr
-        session.query(ChatHistory).filter_by(user_id=user_id).delete()
+        session.query(ChatHistory).filter_by(user_id=user_id or '').delete()  # Handle missing user_id
         session.commit()
         return jsonify({"message": "All chat history cleared successfully."})
+    except SQLAlchemyError as e:
+        print(f"Database error in clear_chats: {e}")
+        session.rollback()
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     except Exception as e:
         print(f"Error in clear_chats: {e}")
         session.rollback()
-        return jsonify({"error": f"Failed to clear chats—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     finally:
         session.close()
 
@@ -588,10 +609,14 @@ def delete_chat():
         session.query(ChatHistory).filter_by(chat_id=chat_id).delete()
         session.commit()
         return jsonify({"message": f"Chat {chat_id} deleted successfully.", "chat_id": chat_id})
+    except SQLAlchemyError as e:
+        print(f"Database error in delete_chat: {e}")
+        session.rollback()
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     except Exception as e:
         print(f"Error in delete_chat: {e}")
         session.rollback()
-        return jsonify({"error": f"Delete failed—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
     finally:
         session.close()
 
@@ -655,7 +680,7 @@ def get_suggestions():
         return jsonify({"suggestion": suggestion})
     except Exception as e:
         print(f"Error in get_suggestions: {e}")
-        return jsonify({"error": f"Failed to fetch suggestions—{e}"}), 500
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
 
 @app.route("/test")
 def test():
