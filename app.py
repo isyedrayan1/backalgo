@@ -48,18 +48,32 @@ def store_chat(chat_id, user_msg, ai_msg, title=None, welcome_shown=0):
     session = Session()
     try:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        title = title or (user_msg[:50].strip() if user_msg else f"Chat {chat_id}")
-        ai_msg = re.sub(r'\[INST\].*?\[/INST\]', '', ai_msg, flags=re.DOTALL)
-        ai_msg = re.sub(r'<s>', '', ai_msg).strip()
-        chat = ChatHistory(
-            chat_id=chat_id,
-            user_msg=user_msg,
-            ai_msg=ai_msg,
-            timestamp=timestamp,
-            title=title,
-            welcome_shown=welcome_shown
-        )
-        session.merge(chat)  # Upsert behavior
+        # Aggregate conversation into a single entry per session
+        existing_chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
+        if existing_chat:
+            # Append new messages to existing conversation
+            existing_user_msg = existing_chat.user_msg or ""
+            existing_ai_msg = existing_chat.ai_msg or ""
+            if user_msg:
+                existing_user_msg += f"\n{user_msg}" if existing_user_msg else user_msg
+            if ai_msg:
+                existing_ai_msg += f"\n{ai_msg}" if existing_ai_msg else ai_msg
+            existing_chat.user_msg = existing_user_msg
+            existing_chat.ai_msg = existing_ai_msg
+        else:
+            # New session with initial messages
+            ai_msg = re.sub(r'\[INST\].*?\[/INST\]', '', ai_msg, flags=re.DOTALL)
+            ai_msg = re.sub(r'<s>', '', ai_msg).strip()
+            title = title or user_msg[:50].strip() if user_msg else "Untitled"
+            chat = ChatHistory(
+                chat_id=chat_id,
+                user_msg=user_msg or "",
+                ai_msg=ai_msg or "",
+                timestamp=timestamp,
+                title=title,
+                welcome_shown=welcome_shown
+            )
+            session.add(chat)
         session.commit()
         print(f"Stored chat: chat_id={chat_id}, title={title}")
     except Exception as e:
@@ -71,9 +85,15 @@ def store_chat(chat_id, user_msg, ai_msg, title=None, welcome_shown=0):
 def get_chat_history(chat_id):
     session = Session()
     try:
-        chats = session.query(ChatHistory).filter_by(chat_id=chat_id).order_by(ChatHistory.timestamp).all()
-        history = [{"user": chat.user_msg, "ai": chat.ai_msg} for chat in chats if chat.user_msg or chat.ai_msg]
-        return history
+        chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
+        if chat and (chat.user_msg or chat.ai_msg):
+            # Split messages into an array of turns
+            user_msgs = [msg.strip() for msg in (chat.user_msg or "").split("\n") if msg.strip()]
+            ai_msgs = [msg.strip() for msg in (chat.ai_msg or "").split("\n") if msg.strip()]
+            # Pair user and AI messages, taking the min length to avoid unpaired messages
+            history = [{"user": user, "ai": ai} for user, ai in zip(user_msgs, ai_msgs[:len(user_msgs)])]
+            return history[-MAX_HISTORY:]  # Limit to MAX_HISTORY turns
+        return []
     except Exception as e:
         print(f"Database error during get_chat_history: {e}")
         return []
@@ -83,8 +103,11 @@ def get_chat_history(chat_id):
 def get_previous_response(chat_id):
     session = Session()
     try:
-        last_chat = session.query(ChatHistory).filter_by(chat_id=chat_id).order_by(ChatHistory.timestamp.desc()).first()
-        return last_chat.ai_msg if last_chat else None
+        chat = session.query(ChatHistory).filter_by(chat_id=chat_id).first()
+        if chat and chat.ai_msg:
+            ai_msgs = [msg.strip() for msg in chat.ai_msg.split("\n") if msg.strip()]
+            return ai_msgs[-1] if ai_msgs else None
+        return None
     except Exception as e:
         print(f"Database error during get_previous_response: {e}")
         return None
@@ -105,11 +128,14 @@ def has_welcome_been_shown(chat_id):
 def get_chat_by_title_or_id(identifier):
     session = Session()
     try:
-        chat = session.query(ChatHistory).filter_by(chat_id=identifier).order_by(ChatHistory.timestamp).first()
+        chat = session.query(ChatHistory).filter_by(chat_id=identifier).first()
         if not chat:
-            chat = session.query(ChatHistory).filter_by(title=identifier).order_by(ChatHistory.timestamp).first()
+            chat = session.query(ChatHistory).filter_by(title=identifier).first()
         if chat:
-            history = [{"user": chat.user_msg, "ai": chat.ai_msg}] if chat.user_msg or chat.ai_msg else []
+            history = [{"user": u, "ai": a} for u, a in zip(
+                [msg.strip() for msg in (chat.user_msg or "").split("\n") if msg.strip()],
+                [msg.strip() for msg in (chat.ai_msg or "").split("\n") if msg.strip()]
+            )] if chat.user_msg or chat.ai_msg else []
             return {"chat_id": chat.chat_id, "title": chat.title, "history": history}
         return None
     except Exception as e:
@@ -125,14 +151,10 @@ def get_all_chats():
         unique_titles = []
         seen_chat_ids = set()
         for chat in chats:
-            if chat.chat_id in seen_chat_ids:
+            if chat.chat_id in seen_chat_ids or not (chat.user_msg or chat.ai_msg):
                 continue
-            if not chat.user_msg:
-                continue
-            final_title = (chat.title if chat.title and chat.title.strip() else
-                          (chat.user_msg[:50].strip() if chat.user_msg and chat.user_msg.strip() else
-                           f"Chat {chat.chat_id}"))[:100]
-            unique_titles.append({"chat_id": chat.chat_id, "title": final_title})
+            title = chat.title if chat.title and chat.title.strip() else chat.user_msg.split("\n")[0][:50].strip() if chat.user_msg else "Untitled"
+            unique_titles.append({"chat_id": chat.chat_id, "title": title[:100]})
             seen_chat_ids.add(chat.chat_id)
         return unique_titles
     except Exception as e:
@@ -189,7 +211,7 @@ def classify_query(prompt):
 
 # Response Formatting
 def format_response(response):
-    response = re.sub(r'AlgoAI', 'the assistant', response, flags=re.IGNORECASE)
+    response = re.sub(r'the assistant', 'AlgoAI', response, flags=re.IGNORECASE)
     response = re.sub(r'\[INST\].*?\[/INST\]', '', response, flags=re.DOTALL)
     response = re.sub(r'<s>', '', response)
     response = response.strip()
@@ -232,25 +254,26 @@ def query_groq(chat_id, prompt, deep_dive=False):
     print("DEBUG: Running query_groq v6 - 2025-04-04 12:00 UTC")
     mode = classify_query(prompt)
     last_response = get_previous_response(chat_id) if deep_dive else None
-    chat_history = get_chat_history(chat_id)[-MAX_HISTORY:]
+    chat_history = get_chat_history(chat_id)
 
     SYSTEM_PROMPT = (
-        "You are an expert in coding, algorithms, and system design. Your responses must always be:\n"
+        "You are AlgoAI, an expert in coding, algorithms, and system design. Your responses must always be:\n"
         "- **Fully detailed and well-structured** with clear, numbered sections as instructed.\n"
         "- **Professional & technical**, assuming the user is a developer or engineer.\n"
-        "- **Highly interactive** with logical suggestions, improvements, and follow-up questions.\n"
-        "- **Context-aware**, referencing previous messages to maintain a natural flow.\n"
+        "- **Highly interactive** with logical suggestions and follow-up questions when relevant to the query.\n"
+        "- **Context-aware**, referencing previous messages in the session to maintain a natural flow.\n"
         "- **Focused on best practices, optimization, and scalability considerations.**\n\n"
         "**Strict Response Format (for all modes):**\n"
         "- Use **bold (**text**) for key terms and section headers.\n"
-        "- End each response with a specific follow-up question as instructed.\n"
+        "- Include a contextually relevant follow-up question only if it naturally extends the discussion (e.g., based on the query or response content).\n"
         "- Do not repeat previous responses unless explicitly building on them.\n"
-        "- Do not mention any specific identity or name (e.g., 'AlgoAI') in responses; use generic phrasing like 'Here is an example...' or 'This approach suggests...'\n\n"
+        "- Always identify yourself as AlgoAI in responses (e.g., 'AlgoAI suggests...' or 'As AlgoAI, I recommend...').\n\n"
         "**Mode-Specific Rules:**\n"
-        "- For tech queries, include all sections: Concept Explanation, Complexity Analysis, Example Implementation, Alternative Approaches, Performance Optimization, Next Steps.\n"
-        "- For general queries or deep dives, adapt the structure but maintain depth and interactivity.\n"
-        "- If a code example is requested but not provided, include a default example (e.g., a simple Python `print()` statement).\n"
-        "- For developer queries (e.g., 'who developed'), respond with: 'This application was developed by the Algo Team.'"
+        "- For tech queries, include: Concept Explanation, Complexity Analysis, Example Implementation, Alternative Approaches, Performance Optimization, Next Steps.\n"
+        "- For general queries or deep dives, adapt the structure with depth and interactivity.\n"
+        "- If a code example is requested but not provided, include a default example (e.g., a Python `print()` statement).\n"
+        "- For developer queries (e.g., 'who developed'), respond with: 'This application was developed by the Algo Team.'\n"
+        "- Avoid mentioning model details or generic phrases; focus on the AlgoAI persona."
     )
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -265,70 +288,64 @@ def query_groq(chat_id, prompt, deep_dive=False):
         return "Please provide your next query."
     elif mode == "greeting":
         messages.append({"role": "system", "content": (
-            "Provide a detailed and engaging introduction:\n"
-            "**1. Welcome Message**: Greet the user warmly and introduce the assistant's purpose (2-3 sentences).\n"
-            "**2. Capabilities**: Highlight key areas of expertise (e.g., coding, algorithms, system design) (1-2 sentences).\n"
+            "As AlgoAI, provide a detailed and engaging introduction:\n"
+            "**1. Welcome Message**: Greet the user warmly and state your purpose (2-3 sentences).\n"
+            "**2. Capabilities**: Highlight expertise in coding, algorithms, and system design (1-2 sentences).\n"
             "**3. Invitation**: Encourage the user to ask a question (1 sentence)."
         )})
         max_tokens = 200
         temp = 0.5
-        follow_up = "**What would you like to explore today?**"
     elif mode == "tech":
         language_match = re.search(r'\b(in|using)\s*(python|java|c\+\+|javascript|typescript|go|rust|ruby|php|kotlin|swift)\b', prompt, re.IGNORECASE)
         preferred_language = language_match.group(2).lower() if language_match else "python"
         if deep_dive and last_response:
             messages.append({"role": "system", "content": (
-                f"Build on the previous response: **Previous response: {last_response}**\n"
+                "As AlgoAI, build on the previous response: **Previous response: {last_response}**\n"
                 "**1. Detailed Analysis**: Analyze the last response in depth (2-3 sentences).\n"
-                "**2. Improvements**: Suggest specific optimizations or debugging tips if code was included (2-3 sentences).\n"
-                "**3. Alternatives**: Compare with at least one alternative approach (1-2 sentences).\n"
-                "**4. Next Steps**: Propose a related topic or question (1 sentence).\n"
+                "**2. Improvements**: Suggest optimizations or debugging tips if code was included (2-3 sentences).\n"
+                "**3. Alternatives**: Compare with one alternative approach (1-2 sentences).\n"
+                "**4. Next Steps**: Propose a related topic (1 sentence).\n"
                 "No repeats—keep it new."
             )})
             max_tokens = 1200
             temp = 0.2
-            follow_up = "**Would you like a different approach or more depth?**"
         else:
             messages.append({"role": "system", "content": (
-                f"Provide a clear, step-by-step technical response:\n"
+                "As AlgoAI, provide a clear, step-by-step technical response:\n"
                 f"**1. Clarify Intent**: State the intent and preferred language (**{preferred_language}** if specified, else Python) (1 sentence).\n"
                 "**2. Concept Explanation**: Explain the algorithmic foundation with theory (2-3 sentences).\n"
-                "**3. Complexity Analysis**: Break down the logical structure with Big-O time and space complexity (2-3 sentences).\n"
-                "**4. Example Implementation**: Show a clean, well-commented code example in {preferred_language} with ``` blocks (2-3 sentences).\n"
-                "**5. Alternative Approaches**: Suggest at least one alternative solution (1-2 sentences).\n"
-                "**6. Performance Optimization**: Offer ways to improve efficiency or scalability (1-2 sentences).\n"
-                "**7. Next Steps**: Encourage exploration of related topics (1 sentence)."
+                "**3. Complexity Analysis**: Break down Big-O time and space complexity (2-3 sentences).\n"
+                "**4. Example Implementation**: Show a clean, commented code example in {preferred_language} with ``` blocks (2-3 sentences).\n"
+                "**5. Alternative Approaches**: Suggest one alternative solution (1-2 sentences).\n"
+                "**6. Performance Optimization**: Offer efficiency or scalability improvements (1-2 sentences).\n"
+                "**7. Next Steps**: Suggest a related topic if relevant (1 sentence)."
             )})
             max_tokens = 1000
             temp = 0.2
-            follow_up = "**Would you like a deeper explanation?**"
     elif mode == "developer":
-        return "This application was developed by the Algo Team.\n\n**Do you have any other questions about the application?**"
+        return "This application was developed by the Algo Team.\n\nAs AlgoAI, do you have any other questions about the application?"
     else:
         if deep_dive and last_response:
             messages.append({"role": "system", "content": (
-                f"Expand on the previous response: **Previous response: {last_response}**\n"
-                "**1. In-Depth Analysis**: Provide detailed insights or examples (2-3 sentences).\n"
-                "**2. Improvements**: Suggest enhancements or related considerations (1-2 sentences).\n"
-                "**3. Next Steps**: Encourage further exploration (1 sentence).\n"
+                "As AlgoAI, expand on the previous response: **Previous response: {last_response}**\n"
+                "**1. In-Depth Analysis**: Provide detailed insights (2-3 sentences).\n"
+                "**2. Improvements**: Suggest enhancements (1-2 sentences).\n"
+                "**3. Next Steps**: Encourage further exploration if relevant (1 sentence).\n"
                 "No repeats—keep it new."
             )})
             max_tokens = 600
             temp = 0.3
-            follow_up = "**Would you like to dig deeper?**"
         else:
             if "joke" in prompt.lower():
                 messages.append({"role": "system", "content": (
-                    "Provide a lighthearted joke, followed by a brief response related to the query (2-3 sentences)."
+                    "As AlgoAI, provide a lighthearted joke followed by a brief response (2-3 sentences)."
                 )})
-                follow_up = "**Do you have further questions or would you like a deeper explanation on a topic?**"
             else:
                 messages.append({"role": "system", "content": (
-                    "Give a clear, concise response:\n"
-                    "**1. Direct Answer**: Answer the question directly (1-2 sentences).\n"
+                    "As AlgoAI, give a clear, concise response:\n"
+                    "**1. Direct Answer**: Answer directly (1-2 sentences).\n"
                     "**2. Context**: Add relevant context if applicable (1 sentence)."
                 )})
-                follow_up = "**Do you have further questions or would you like a deeper explanation on a topic?**"
             max_tokens = 400
             temp = 0.3
 
@@ -350,8 +367,6 @@ def query_groq(chat_id, prompt, deep_dive=False):
             bot_response = json_response["choices"][0]["message"]["content"].strip()
             if not bot_response:
                 return "Error: No response generated. Please try again."
-            if follow_up and follow_up not in bot_response:
-                bot_response += f"\n\n{follow_up}"
             print(f"Groq response received: length={len(bot_response)}")
             # Update welcome_shown if it's a greeting
             if mode == "greeting" and not welcome_shown:
@@ -368,7 +383,7 @@ def query_groq(chat_id, prompt, deep_dive=False):
 # Routes
 @app.route("/")
 def home():
-    return jsonify({"message": "Welcome to your coding assistant! Use /query to begin."}), 200
+    return jsonify({"message": "Welcome to AlgoAI! Use /query to begin."}), 200
 
 @app.route("/favicon.ico")
 def favicon():
@@ -383,7 +398,6 @@ def get_response():
         deep_dive = data.get("deep_dive", False)
         groq_response = query_groq(chat_id, user_query, deep_dive)
         formatted_response = format_response(groq_response)
-        # Store the chat only when a user message is sent
         if user_query.strip():
             store_chat(chat_id, user_query, formatted_response)
         return jsonify({"response": formatted_response, "chat_id": chat_id})
@@ -396,17 +410,16 @@ def new_chat():
     try:
         chat_id = str(uuid.uuid4())
         welcome_messages = [
-            "Welcome to your coding assistant! 🚀 I'm here to help with coding, algorithms, and system design. What would you like to explore?",
-            "Greetings! I'm your technical assistant for coding and design challenges. What topic can I assist you with today?",
-            "Hello! I'm here to dive into the world of coding and algorithms with you. What's your first question?",
-            "Welcome back! I'm ready to assist with your next coding challenge. What would you like to explore?"
+            "Welcome to AlgoAI! I'm here to assist with coding, algorithms, and system design. What would you like to explore?",
+            "Greetings from AlgoAI! I'm your technical assistant for coding and design challenges. What can I help you with today?",
+            "Hello! As AlgoAI, I'm ready to dive into coding and algorithms with you. What's your first question?",
+            "Welcome back to AlgoAI! I'm here to assist with your next coding challenge. What would you like to explore?"
         ]
         existing_chats = get_all_chats()
         is_returning = len(existing_chats) > 0
         greeting = random.choice(welcome_messages)
         if is_returning:
-            greeting = "Welcome back! I'm ready to assist with your next coding challenge. What would you like to explore?"
-        # Do not store the chat in the database yet; wait for the first user message
+            greeting = "Welcome back to AlgoAI! I'm here to assist with your next coding challenge. What would you like to explore?"
         return jsonify({"chat_id": chat_id, "greeting": greeting})
     except Exception as e:
         print(f"Error in new_chat: {e}")
@@ -435,7 +448,7 @@ def get_current_chat():
     try:
         chat_id = request.args.get("chat_id", str(uuid.uuid4()))
         history = get_chat_history(chat_id)
-        title = get_chat_title(chat_id) or (history[0]["user"][:50].strip() if history and history[0]["user"] else f"Chat #{chat_id}")
+        title = get_chat_title(chat_id) or (history[0]["user"][:50].strip() if history and history[0]["user"] else "Untitled")
         return jsonify({"chat_id": chat_id, "title": title, "history": history})
     except Exception as e:
         print(f"Error in get_current_chat: {e}")
@@ -528,7 +541,7 @@ def delete_chat():
 def get_suggestions():
     try:
         category = request.args.get("category", "general").lower()
-        current_time = int(time.time())  # Use current timestamp for randomization
+        current_time = int(time.time())
 
         suggestion_pools = {
             "explore": [
